@@ -128,6 +128,10 @@ namespace XLua
             {
                 return hasGenericParameter(((ByReferenceType)type).ElementType);
             }
+            if (type.IsArray)
+            {
+                return hasGenericParameter(((ArrayType)type).ElementType);
+            }
             if (type.IsGenericInstance)
             {
                 foreach (var typeArg in ((GenericInstanceType)type).GenericArguments)
@@ -142,21 +146,98 @@ namespace XLua
             return type.IsGenericParameter;
         }
 
-        static bool IsContainsGenericParameter(this MethodReference method)
+        static bool isNoPublic(AssemblyDefinition assembly, TypeReference type)
         {
-            if (hasGenericParameter(method.ReturnType))
+            if (type.IsByReference)
+            {
+                return isNoPublic(assembly, ((ByReferenceType)type).ElementType);
+            }
+            if (type.IsArray)
+            {
+                return isNoPublic(assembly, ((ArrayType)type).ElementType);
+            }
+            else
+            {
+                var scope = type.Scope;
+                if (type.Scope.MetadataScopeType == MetadataScopeType.AssemblyNameReference
+                    && ((AssemblyNameReference)scope).Name != assembly.MainModule.FullyQualifiedName) // other assembly must be public
+                {
+                    return false;
+                }
+                var resolveType = type.Resolve();
+                if ((!type.IsNested && !resolveType.IsPublic) || (type.IsNested && !resolveType.IsNestedPublic))
+                {
+                    return true;
+                }
+                if (type.IsGenericInstance)
+                {
+                    foreach (var typeArg in ((GenericInstanceType)type).GenericArguments)
+                    {
+                        if (isNoPublic(assembly, typeArg))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+
+        }
+
+        static bool genericInOut(AssemblyDefinition assembly, MethodReference method)
+        {
+            if (hasGenericParameter(method.ReturnType) || isNoPublic(assembly, method.ReturnType))
             {
                 return true;
             }
             var parameters = method.Parameters;
             for (int i = 0; i < parameters.Count; i++)
             {
-                if (hasGenericParameter(parameters[i].ParameterType))
+                if (hasGenericParameter(parameters[i].ParameterType) || isNoPublic(assembly, parameters[i].ParameterType))
                 {
                     return true;
                 }
             }
             return false;
+        }
+
+        static bool injectType(AssemblyDefinition assembly, TypeReference hotfixAttributeType, TypeDefinition type)
+        {
+            foreach(var nestedTypes in type.NestedTypes)
+            {
+                if (!injectType(assembly, hotfixAttributeType, nestedTypes))
+                {
+                    return false;
+                }
+            }
+            CustomAttribute hotfixAttr = type.CustomAttributes.FirstOrDefault(ca => ca.AttributeType == hotfixAttributeType);
+            if (hotfixAttr != null)
+            {
+                int hotfixType = (int)hotfixAttr.ConstructorArguments[0].Value;
+                FieldReference stateTable = null;
+                if (hotfixType == 1)
+                {
+                    if (type.IsAbstract && type.IsSealed)
+                    {
+                        throw new InvalidOperationException(type.FullName + " is static, can not be mark as Stateful!");
+                    }
+                    var stateTableDefinition = new FieldDefinition("__Hitfix_xluaStateTable", Mono.Cecil.FieldAttributes.Private, luaTableType);
+                    type.Fields.Add(stateTableDefinition);
+                    stateTable = stateTableDefinition.GetGeneric();
+                }
+                foreach (var method in type.Methods)
+                {
+                    if (method.Name != ".cctor" && !method.IsAbstract)
+                    {
+                        if ((method.HasGenericParameters || genericInOut(assembly, method)) ? !injectGenericMethod(assembly, method, hotfixType, stateTable) :
+                            !injectMethod(assembly, method, hotfixType, stateTable))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
         }
 
         [DidReloadScripts]
@@ -186,32 +267,9 @@ namespace XLua
             var hotfixAttributeType = assembly.MainModule.Types.Single(t => t.FullName == "XLua.HotfixAttribute");
             foreach (var type in (from module in assembly.Modules from type in module.Types select type))
             {
-                CustomAttribute hotfixAttr = type.CustomAttributes.FirstOrDefault(ca => ca.AttributeType == hotfixAttributeType);
-                if (hotfixAttr != null)
+                if (!injectType(assembly, hotfixAttributeType, type))
                 {
-                    int hotfixType = (int)hotfixAttr.ConstructorArguments[0].Value;
-                    FieldReference stateTable = null;
-                    if (hotfixType == 1)
-                    {
-                        if (type.IsAbstract && type.IsSealed)
-                        {
-                            throw new InvalidOperationException(type.FullName + " is static, can not be mark as Stateful!");
-                        }
-                        var stateTableDefinition = new FieldDefinition("__Hitfix_xluaStateTable", Mono.Cecil.FieldAttributes.Private, luaTableType);
-                        type.Fields.Add(stateTableDefinition);
-                        stateTable = stateTableDefinition.GetGeneric();
-                    }
-                    foreach (var method in type.Methods)
-                    {
-                        if (method.Name != ".cctor")
-                        {
-                            if ((method.HasGenericParameters || method.IsContainsGenericParameter()) ? ! InjectGenericMethod(assembly, method, hotfixType, stateTable) : 
-                                !InjectMethod(assembly, method, hotfixType, stateTable))
-                            {
-                                return;
-                            }
-                        }
-                    }
+                    return;
                 }
             }
 #if HOTFIX_DEBUG_SYMBOLS
@@ -250,7 +308,7 @@ namespace XLua
             return luaDelegateName;
         }
 
-        static bool InjectMethod(AssemblyDefinition assembly, MethodDefinition method, int hotfixType, FieldReference stateTable)
+        static bool injectMethod(AssemblyDefinition assembly, MethodDefinition method, int hotfixType, FieldReference stateTable)
         {
             var type = method.DeclaringType;
             var luaDelegateName = getDelegateName(method);
@@ -378,7 +436,7 @@ namespace XLua
             return definition;
         }
 
-        static bool InjectGenericMethod(AssemblyDefinition assembly, MethodDefinition method, int hotfixType, FieldReference stateTable)
+        static bool injectGenericMethod(AssemblyDefinition assembly, MethodDefinition method, int hotfixType, FieldReference stateTable)
         {
             var type = method.DeclaringType;
             var luaDelegateName = getDelegateName(method);

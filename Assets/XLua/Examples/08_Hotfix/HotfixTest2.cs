@@ -85,6 +85,27 @@ public class GenericClass<T>
     }
 }
 
+[Hotfix]
+public class InnerTypeTest
+{
+    public void Foo()
+    {
+        _InnerStruct ret = Bar();
+        Debug.Log("{x=" + ret.x + ",y= " + ret.y + "}");
+    }
+
+    struct _InnerStruct
+    {
+        public int x;
+        public int y;
+    }
+
+    _InnerStruct Bar()
+    {
+        return new _InnerStruct { x = 1, y = 2 };
+    }
+}
+
 public class HotfixTest2 : MonoBehaviour {
 
 	// Use this for initialization
@@ -260,7 +281,24 @@ public class HotfixTest2 : MonoBehaviour {
         genericObj.Func1();
         Debug.Log(genericObj.Func2());
 
-        calc.TestOut(100, out num, ref str, gameObject);
+        InnerTypeTest itt = new InnerTypeTest();
+        itt.Foo();
+        luaenv.DoString(@"
+            xlua.hotfix(CS.InnerTypeTest, 'Bar', function(obj)
+                    print('lua Bar', obj)
+                    return {x = 10, y = 20}
+                end)
+        ");
+        itt.Foo();
+
+        try
+        {
+            calc.TestOut(100, out num, ref str, gameObject);
+        }
+        catch(LuaException e)
+        {
+            Debug.Log("throw in lua an catch in c# ok, e.Message:" + e.Message);
+        }
     }
 
     void TestStateful()
